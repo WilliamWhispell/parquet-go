@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"fmt"
 	"io"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -40,6 +41,10 @@ type ParquetWriter struct {
 	NumRows     int64
 
 	DictRecs map[string]*layout.DictRecType
+
+	// aligned to row-group, col
+	ColumnIndexes []*parquet.ColumnIndex
+	OffsetIndexes []*parquet.OffsetIndex
 
 	MarshalFunc func(src []interface{}, sh *schema.SchemaHandler) (*map[string]*layout.Table, error)
 }
@@ -130,6 +135,58 @@ func (self *ParquetWriter) WriteStop() error {
 	ts := thrift.NewTSerializer()
 	ts.Protocol = thrift.NewTCompactProtocolFactory().GetProtocol(ts.Transport)
 	self.RenameSchema()
+
+	// write col indexes
+	fmt.Println("writing col indexes to file")
+	cidx := 0
+	for _, rg := range self.Footer.RowGroups {
+
+		for _, colchunk := range rg.Columns {
+
+			colIdxBuf, err := ts.Write(context.TODO(), self.ColumnIndexes[cidx])
+			if err != nil {
+				return err
+			}
+			if _, err = self.PFile.Write(colIdxBuf); err != nil {
+				return err
+			}
+			cidx++
+			
+			pos := self.Offset
+			colchunk.ColumnIndexOffset = &pos
+			idxlen := int32(len(colIdxBuf))
+			colchunk.ColumnIndexLength = &idxlen
+
+			self.Offset += int64(len(colIdxBuf))
+		}
+	}
+
+	// write offset indexes
+	fmt.Println("writing offset indexes to file")
+	cidx = 0
+	for _, rg := range self.Footer.RowGroups {
+
+		for _, colchunk := range rg.Columns {
+
+			offsetIdxBuf, err := ts.Write(context.TODO(), self.OffsetIndexes[cidx])
+			if err != nil {
+				return err
+			}
+			if _, err = self.PFile.Write(offsetIdxBuf); err != nil {
+				return err
+			}
+			cidx++
+			
+			pos := self.Offset
+			colchunk.OffsetIndexOffset = &pos
+			idxlen := int32(len(offsetIdxBuf))
+			colchunk.OffsetIndexLength = &idxlen
+
+			self.Offset += int64(len(offsetIdxBuf))
+		}
+	}
+
+
 	footerBuf, err := ts.Write(context.TODO(), self.Footer)
 	if err != nil {
 		return err
@@ -336,7 +393,22 @@ func (self *ParquetWriter) Flush(flag bool) error {
 			rowGroup.Chunks[k].ChunkHeader.MetaData.DataPageOffset = -1
 			rowGroup.Chunks[k].ChunkHeader.FileOffset = self.Offset
 
-			for l := 0; l < len(rowGroup.Chunks[k].Pages); l++ {
+			pgCount := len(rowGroup.Chunks[k].Pages)
+
+			colIdx := new(parquet.ColumnIndex)
+			colIdx.NullPages = make([]bool, pgCount)
+			colIdx.MinValues = make([][]byte, pgCount)
+			colIdx.MaxValues = make([][]byte, pgCount)
+			colIdx.BoundaryOrder = parquet.BoundaryOrder_UNORDERED; //todo: implement
+			self.ColumnIndexes = append(self.ColumnIndexes, colIdx)
+
+			offsetIdx := new(parquet.OffsetIndex)
+			offsetIdx.PageLocations = make([]*parquet.PageLocation, 0)
+			self.OffsetIndexes = append(self.OffsetIndexes, offsetIdx)
+
+			rgIdx := int64(0)
+
+			for l := 0; l < pgCount; l++ {
 				if rowGroup.Chunks[k].Pages[l].Header.Type == parquet.PageType_DICTIONARY_PAGE {
 					tmp := self.Offset
 					rowGroup.Chunks[k].ChunkHeader.MetaData.DictionaryPageOffset = &tmp
@@ -344,7 +416,28 @@ func (self *ParquetWriter) Flush(flag bool) error {
 					rowGroup.Chunks[k].ChunkHeader.MetaData.DataPageOffset = self.Offset
 
 				}
-				data := rowGroup.Chunks[k].Pages[l].RawData
+
+				pg := rowGroup.Chunks[k].Pages[l]
+
+				if  pg.Header.DataPageHeader == nil {
+					panic(errors.New("unsupported data page"))
+				}
+				
+				colIdx.MinValues[l] = pg.Header.DataPageHeader.Statistics.Min
+				colIdx.MaxValues[l] = pg.Header.DataPageHeader.Statistics.Max
+				
+
+				pgLoc := new(parquet.PageLocation)
+				pgLoc.Offset = self.Offset
+				pgLoc.FirstRowIndex = rgIdx
+				pgLoc.CompressedPageSize = pg.Header.CompressedPageSize /* + header len - todo*/
+
+				offsetIdx.PageLocations = append(offsetIdx.PageLocations, pgLoc)
+
+				rgIdx += int64(pg.Header.DataPageHeader.NumValues)
+
+
+				data := pg.RawData
 				if _, err = self.PFile.Write(data); err != nil {
 					return err
 				}
